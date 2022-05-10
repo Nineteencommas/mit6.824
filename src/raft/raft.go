@@ -193,8 +193,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entry        []int
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -269,6 +273,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -283,11 +288,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.myState = STATE_FOLLOWER
 		}
+
+		if len(rf.log) < args.PrevLogIndex {
+			reply.Success = false
+			return
+		}
+		if rf.log[args.PrevLogIndex] != args.PrevLogTerm {
+			rf.log = rf.log[args.PrevLogIndex:rf.log[len(rf.log)-1]]
+			return
+		}
+		for entry := range args.Entry {
+			rf.log = append(rf.log, entry)
+		}
+		if args.LeaderCommit > rf.commitedIndex {
+			if args.LeaderCommit > len(rf.log) {
+
+			}
+			rf.commitedIndex = Min(rf.commitedIndex, args.LeaderCommit)
+		}
 	}
-	rf.mu.Unlock()
+}
+
+func Min(x, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
+	}
 }
 func (rf *Raft) replicate() {
-
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		result := false
+		for !result {
+			args := AppendEntriesArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-2], []int{rf.currentTerm}, rf.commitedIndex}
+			reply := AppendEntriesReply{}
+			rf.sendAppendEntries(peer, &args, &reply)
+			result = reply.Success
+			// 记录每个peer的matchindex 并--直到发送正确的
+		}
+	}
 }
 
 //
@@ -317,7 +359,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 
 	} else {
-		index = rf.lastApplied + 1
+		index = rf.commitedIndex + 1
 		term = rf.currentTerm
 		go rf.replicate()
 	}
