@@ -85,14 +85,14 @@ type Raft struct {
 	myState     ServerState
 	reset       bool
 	resetMu     sync.Mutex
-
 	// below is for 2B
-	log           []int //  stores the command and term, in the test command is ignored, only term is stored
+	log           []Entry //  stores the command and term, in the test command is ignored, only term is stored
 	commitedIndex int
 	lastApplied   int
 	//2B for leader
 	nextIndex  []int
 	matchIndex []int
+	applyCh    chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -192,12 +192,17 @@ type RequestVoteReply struct {
 	VoteGranted bool //true if candidate received vote
 }
 
+type Entry struct {
+	Command interface{}
+	Term    int
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entry        []int
+	Entries      []Entry
 	LeaderCommit int
 }
 
@@ -293,18 +298,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			return
 		}
-		if rf.log[args.PrevLogIndex] != args.PrevLogTerm {
-			rf.log = rf.log[args.PrevLogIndex:rf.log[len(rf.log)-1]]
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			rf.log = rf.log[args.PrevLogIndex : len(rf.log)-1]
 			return
 		}
-		for entry := range args.Entry {
+		for _, entry := range args.Entries {
 			rf.log = append(rf.log, entry)
 		}
 		if args.LeaderCommit > rf.commitedIndex {
 			if args.LeaderCommit > len(rf.log) {
-
 			}
-			rf.commitedIndex = Min(rf.commitedIndex, args.LeaderCommit)
+			rf.commitedIndex = Min(len(rf.log)-1, args.LeaderCommit)
 		}
 	}
 }
@@ -316,20 +320,40 @@ func Min(x, y int) int {
 		return y
 	}
 }
+
 func (rf *Raft) replicate() {
+	count := 0
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		result := false
 		for !result {
-			args := AppendEntriesArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-2], []int{rf.currentTerm}, rf.commitedIndex}
+			args := AppendEntriesArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-2].Term, rf.getEntriesToSend(peer), rf.commitedIndex}
 			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(peer, &args, &reply)
 			result = reply.Success
-			// 记录每个peer的matchindex 并--直到发送正确的
+			if !result {
+				rf.nextIndex[peer]--
+			} else {
+				count++
+				rf.nextIndex[peer] = len(rf.log)
+				rf.matchIndex[peer] = len(rf.log) - 1
+			}
+		}
+
+		// TODO the count need to be changed
+		if count > len(rf.peers)/2 {
+			if rf.currentTerm == rf.log[len(rf.log)-1].Term {
+				rf.commitedIndex = len(rf.log) - 1
+			}
 		}
 	}
+}
+
+func (rf *Raft) getEntriesToSend(peer int) []Entry {
+	nextIndex := rf.nextIndex[peer]
+	return rf.log[nextIndex+1 : len(rf.log)-1]
 }
 
 //
@@ -492,6 +516,14 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		rf.mu.Lock()
+		if rf.commitedIndex > rf.lastApplied {
+			rf.lastApplied++
+			applyMsg := ApplyMsg{}
+			applyMsg.CommandValid = true
+			applyMsg.CommandIndex = rf.commitedIndex
+			applyMsg.Command = rf.log[len(rf.log)-1].Command
+			rf.applyCh <- applyMsg
+		}
 		if rf.myState == STATE_LEADER {
 			fmt.Printf("%v is the leader at term %v \n", rf.me, rf.currentTerm)
 			rf.mu.Unlock()
@@ -545,6 +577,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.myState = STATE_FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.applyCh = applyCh
 	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
